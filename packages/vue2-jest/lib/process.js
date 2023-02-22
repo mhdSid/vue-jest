@@ -1,178 +1,159 @@
-const VueTemplateCompiler = require('vue-template-compiler')
-const coffeescriptTransformer = require('./transformers/coffee')
-const _processStyle = require('./process-style')
-const processCustomBlocks = require('./process-custom-blocks')
+const vueCompiler = require('vue-template-compiler')
+const compileTemplate = require('./template-compiler')
+const generateSourceMap = require('./generate-source-map')
+const addTemplateMapping = require('./add-template-mapping')
+const compileBabel = require('./compilers/babel-compiler')
+const compileTypescript = require('./compilers/typescript-compiler')
+const compileCoffeeScript = require('./compilers/coffee-compiler')
+const processStyle = require('./process-style')
 const getVueJestConfig = require('./utils').getVueJestConfig
-const logResultErrors = require('./utils').logResultErrors
-const stripInlineSourceMap = require('./utils').stripInlineSourceMap
-const getCustomTransformer = require('./utils').getCustomTransformer
-const loadSrc = require('./utils').loadSrc
-const babelTransformer = require('babel-jest').default
-const generateCode = require('./generate-code')
-const mapLines = require('./map-lines')
+const fs = require('fs')
+const path = require('path')
+const join = path.join
+const logger = require('./logger')
+const convertSourceMap = require('convert-source-map')
+const splitRE = /\r?\n/g
 
-let isVue27 = false
-let compilerUtils
-
-try {
-  compilerUtils = require('vue/compiler-sfc')
-  isVue27 = true
-} catch (e) {
-  compilerUtils = require('@vue/component-compiler-utils')
-}
-
-function resolveTransformer(lang = 'js', vueJestConfig) {
-  const transformer = getCustomTransformer(vueJestConfig['transform'], lang)
-  if (/^typescript$|tsx?$/.test(lang)) {
-    return transformer || require('./transformers/typescript')(lang)
-  } else if (/^coffee$|coffeescript$/.test(lang)) {
-    return transformer || coffeescriptTransformer
-  } else {
-    return transformer || babelTransformer.createTransformer()
-  }
-}
-
-function processScript(scriptPart, filePath, config) {
+function processScript(scriptPart, vueJestConfig, filePath) {
   if (!scriptPart) {
-    return null
+    return { code: '' }
   }
 
-  let externalSrc = null
-  if (scriptPart.src) {
-    scriptPart.content = loadSrc(scriptPart.src, filePath)
-    externalSrc = scriptPart.content
+  if (/^typescript|tsx?$/.test(scriptPart.lang)) {
+    return compileTypescript(scriptPart.content, vueJestConfig, filePath)
   }
 
-  const vueJestConfig = getVueJestConfig(config)
-  const transformer = resolveTransformer(scriptPart.lang, vueJestConfig)
-
-  const result = transformer.process(scriptPart.content, filePath, config)
-  result.code = stripInlineSourceMap(result.code)
-  result.map = mapLines(scriptPart.map, result.map)
-  result.externalSrc = externalSrc
-  return result
-}
-
-function processScriptSetup(descriptor, filePath, config) {
-  if (!descriptor.scriptSetup) {
-    return null
+  if (scriptPart.lang === 'coffee' || scriptPart.lang === 'coffeescript') {
+    return compileCoffeeScript(scriptPart.content, vueJestConfig, filePath)
   }
-  const vueJestConfig = getVueJestConfig(config)
-  const content = compilerUtils.compileScript(descriptor, {
-    id: filePath,
-    reactivityTransform: true,
-    ...vueJestConfig.compilerOptions
-  })
-  const contentMap = mapLines(descriptor.scriptSetup.map, content.map)
 
-  const transformer = resolveTransformer(
-    descriptor.scriptSetup.lang,
-    vueJestConfig
+  return compileBabel(
+    scriptPart.content,
+    undefined,
+    undefined,
+    vueJestConfig,
+    filePath
   )
-
-  const result = transformer.process(content.content, filePath, config)
-  result.code = stripInlineSourceMap(result.code)
-  result.map = mapLines(contentMap, result.map)
-
-  return result
 }
 
-function processTemplate(descriptor, filename, config) {
-  const { template, scriptSetup } = descriptor
+module.exports = function(src, filePath, jestConfig) {
+  const vueJestConfig = getVueJestConfig(jestConfig)
 
-  if (!template) {
-    return null
+  var parts = vueCompiler.parseComponent(src, { pad: true })
+
+  if (parts.script && parts.script.src) {
+    parts.script.content = fs.readFileSync(
+      join(filePath, '..', parts.script.src),
+      'utf8'
+    )
   }
 
-  const vueJestConfig = getVueJestConfig(config)
+  const result = processScript(parts.script, vueJestConfig, filePath)
+  const script = result.code
+  const inputMap = result.sourceMap
 
-  if (template.src) {
-    template.content = loadSrc(template.src, filename)
+  let scriptSrc = src
+  if (parts.script && parts.script.src) {
+    scriptSrc = parts.script.content
   }
 
-  let bindings
-  if (isVue27 && scriptSetup) {
-    const scriptSetupResult = compilerUtils.compileScript(descriptor, {
-      id: filename,
-      reactivityTransform: true,
-      ...vueJestConfig.compilerOptions
-    })
-    bindings = scriptSetupResult.bindings
+  const map = generateSourceMap(script, '', filePath, scriptSrc, inputMap)
+
+  let output =
+    ';(function(){\n' +
+    script +
+    '\n})()\n' +
+    'var defaultExport = (module.exports.__esModule) ? module.exports.default : module.exports;' +
+    'var __vue__options__ = (typeof defaultExport === "function"' +
+    '? defaultExport.options' +
+    ': defaultExport)\n'
+
+  if (parts.template) {
+    parts.template.filename = filePath
+    if (parts.template.src) {
+      parts.template.filename = join(filePath, '..', parts.template.src)
+      parts.template.content = fs.readFileSync(parts.template.filename, 'utf8')
+    }
+
+    const renderFunctions = compileTemplate(parts.template, vueJestConfig)
+
+    output +=
+      '__vue__options__.render = ' +
+      renderFunctions.render +
+      '\n' +
+      '__vue__options__.staticRenderFns = ' +
+      renderFunctions.staticRenderFns +
+      '\n'
+
+    if (parts.template.attrs.functional) {
+      output += '__vue__options__.functional = true\n'
+      output += '__vue__options__._compiled = true\n'
+    }
+
+    if (map) {
+      const beforeLines = output.split(splitRE).length
+      addTemplateMapping(script, parts, output, map, beforeLines)
+    }
   }
 
-  const userTemplateCompilerOptions = vueJestConfig.templateCompiler || {}
-  const result = compilerUtils.compileTemplate({
-    source: template.content,
-    compiler: VueTemplateCompiler,
-    filename: filename,
-    isFunctional: template.attrs.functional,
-    preprocessLang: template.lang,
-    preprocessOptions: vueJestConfig[template.lang],
-    ...userTemplateCompilerOptions,
-    compilerOptions: {
-      ...(!isVue27 ? { optimize: false } : {}),
-      ...userTemplateCompilerOptions.compilerOptions
-    },
-    ...(isVue27 ? { bindings } : {})
-  })
+  if (Array.isArray(parts.styles) && parts.styles.length > 0) {
+    if (
+      parts.styles.some(ast => /^less/.test(ast.lang)) &&
+      logger.shouldLogStyleWarn
+    ) {
+      !vueJestConfig.hideStyleWarn &&
+        logger.warn('Less are not currently compiled by vue-jest')
+      logger.shouldLogStyleWarn = false
+    }
 
-  logResultErrors(result)
+    const styleStr = parts.styles
+      .filter(ast => ast.module)
+      .map(ast => {
+        const styleObj = /^less/.test(ast.lang)
+          ? {}
+          : processStyle(ast, filePath, jestConfig)
 
-  return result
-}
+        const moduleName = ast.module === true ? '$style' : ast.module
 
-function processStyle(styles, filename, config) {
-  if (!styles) {
-    return null
+        return `
+        if(!this['${moduleName}']) {
+          this['${moduleName}'] = {};
+        }
+        this['${moduleName}'] = Object.assign(this['${moduleName}'], ${JSON.stringify(
+          styleObj
+        )});
+        `
+      })
+      .filter(_ => _)
+      .join('')
+
+    if (styleStr.length !== 0) {
+      if (parts.template && parts.template.attrs.functional) {
+        output += `
+        ;(function() {
+          var originalRender = __vue__options__.render
+          var styleFn = function () { ${styleStr} }
+          __vue__options__.render = function renderWithStyleInjection (h, context) {
+            styleFn.call(context)
+            return originalRender(h, context)
+          }
+        })()
+        `
+      } else {
+        output += `
+        ;(function() {
+          var beforeCreate = __vue__options__.beforeCreate
+          var styleFn = function () { ${styleStr} }
+          __vue__options__.beforeCreate = beforeCreate ? [].concat(beforeCreate, styleFn) : [styleFn]
+        })()
+        `
+      }
+    }
   }
 
-  const filteredStyles = styles
-    .filter(style => style.module)
-    .map(style => ({
-      code: _processStyle(style, filename, config),
-      moduleName: style.module === true ? '$style' : style.module
-    }))
-
-  return filteredStyles.length ? filteredStyles : null
-}
-
-module.exports = function(src, filename, config) {
-  const descriptor = compilerUtils.parse({
-    source: src,
-    compiler: isVue27 ? undefined : VueTemplateCompiler,
-    filename
-  })
-
-  const templateResult = processTemplate(descriptor, filename, config)
-  const scriptResult = processScript(descriptor.script, filename, config)
-  const scriptSetupResult = processScriptSetup(descriptor, filename, config)
-  const stylesResult = processStyle(descriptor.styles, filename, config)
-  const customBlocksResult = processCustomBlocks(
-    descriptor.customBlocks,
-    filename,
-    config
-  )
-
-  const isFunctional =
-    (descriptor.template &&
-      descriptor.template.attrs &&
-      descriptor.template.attrs.functional) ||
-    (descriptor.script &&
-      descriptor.script.content &&
-      /functional:\s*true/.test(descriptor.script.content))
-
-  const output = generateCode(
-    scriptResult,
-    scriptSetupResult,
-    templateResult,
-    stylesResult,
-    customBlocksResult,
-    isFunctional,
-    filename
-  )
-
-  return {
-    code: output.code,
-    map: output.map.toString()
+  if (map) {
+    output += '\n' + convertSourceMap.fromJSON(map.toString()).toComment()
   }
+
+  return { code: output }
 }
