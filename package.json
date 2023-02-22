@@ -1,6 +1,7 @@
 {
   "name": "vue-jest-monorepo",
   "private": true,
+  "version": "1.0.0",
   "engines": {
     "node": ">=10",
     "yarn": "^1.17.3"
