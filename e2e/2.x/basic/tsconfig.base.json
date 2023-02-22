@@ -4,7 +4,7 @@
     "lib": ["dom", "es6"],
     "module": "es2015",
     "moduleResolution": "node",
-    "types": ["vue-typescript-import-dts", "node"],
+    "types": ["vue-typescript-import-dts", "jest", "node"],
     "isolatedModules": false,
     "experimentalDecorators": true,
     "noImplicitAny": true,
@@ -15,7 +15,6 @@
     "suppressImplicitAnyIndexErrors": true,
     "allowSyntheticDefaultImports": true,
     "sourceMap": true,
-    "esModuleInterop": true,
     "allowJs": true
   }
 }
